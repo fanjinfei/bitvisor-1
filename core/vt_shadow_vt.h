@@ -27,54 +27,86 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef _CORE_SVM_H
-#define _CORE_SVM_H
+#ifndef _CORE_VT_SHADOW_VT_H
+#define _CORE_VT_SHADOW_VT_H
 
-#include "svm_io.h"
-#include "svm_msr.h"
-#include "svm_vmcb.h"
-
-struct svm_intr_data {
-	union {
-		struct vmcb_eventinj s;
-		u64 v;
-	} vmcb_intr_info;
+enum vmcs_mode {
+	MODE_CLEARED,
+	MODE_NORMAL,
+	MODE_SHADOWING,
+	MODE_NESTED_SHADOWING,
 };
 
-struct svm_vmcb_info {
-	struct vmcb *vmcb;
-	u64 vmcb_phys;
+/**
+ * 24.5 HOST-STATE AREA on Intel SDM
+ * (Order Number: 326019-048US, September 2013)
+ */
+struct vmcs_host_states {
+	u64 cr0;
+	u64 cr3;
+	u64 cr4;
+	u64 rsp;
+	u64 rip;
+	u16 es_sel;
+	u16 cs_sel;
+	u16 ss_sel;
+	u16 ds_sel;
+	u16 fs_sel;
+	u16 gs_sel;
+	u16 tr_sel;
+	u64 fs_base;
+	u64 gs_base;
+	u64 tr_base;
+	u64 gdtr_base;
+	u64 idtr_base;
+	u32 ia32_sysenter_cs;
+	u64 ia32_sysenter_esp;
+	u64 ia32_sysenter_eip;
+	u64 ia32_pat;
+	u64 ia32_efer;
+	u64 ia32_perf_global_ctrl;
 };
 
-struct svm_np;
-
-struct svm {
-	struct svm_vmrun_regs vr;
-	struct svm_vmcb_info vi;
-	struct svm_intr_data intr;
-	struct svm_io *io;
-	struct svm_msrbmp *msrbmp;
-	struct svm_np *np;
-	bool lme, lma, svme;
-	bool init_signal;
-	struct vmcb *saved_vmcb;
-	u64 *cr0, *cr3, *cr4;
-	u64 gcr0, gcr3, gcr4;
-	u64 vm_cr, hsave_pa;
-	u64 iret_dr7;
-	bool nmi_pending;
+struct vmcs_exit_states {
+	u32 exit_reason;
+	ulong qualification;
+	ulong guest_linear_addr;
+	u64 guest_physical_addr;
+	u32 intr_info;
+	u32 intr_err;
 };
 
-struct svm_pcpu_data {
-	void *hsave;
-	u64 hsave_phys;
-	struct vmcb *vmcbhost;
-	u64 vmcbhost_phys;
-	bool flush_by_asid;
-	bool nrip_save;
-	u32 nasid;
+struct shadow_vt {
+	u64 vmxon_region_phys;
+	u64 current_vmcs_hphys;
+	u64 current_vmcs_gphys;
+	enum vmcs_mode mode;
+	enum {
+		EXINT_HACK_MODE_CLEARED,
+		EXINT_HACK_MODE_SET,
+		EXINT_HACK_MODE_READ,
+	} exint_hack_mode;
+	ulong exint_hack_val;
 };
 
-void vmctl_svm_init (void);
+#define VMCS_POINTER_INVALID 0xFFFFFFFFFFFFFFFFULL
+#define EXIT_CTL_SHADOW_MASK \
+	(VMCS_VMEXIT_CTL_HOST_ADDRESS_SPACE_SIZE_BIT |			\
+	 VMCS_VMEXIT_CTL_LOAD_IA32_PERF_GLOBAL_CTRL_BIT |		\
+	 VMCS_VMEXIT_CTL_LOAD_IA32_PAT_BIT)
+
+void vt_emul_vmxon (void);
+void vt_emul_vmxon_in_vmx_root_mode (void);
+void vt_shadow_vt_reset (void);
+void vt_emul_vmxoff (void);
+void vt_emul_vmclear (void);
+void vt_emul_vmptrld (void);
+void vt_emul_vmptrst (void);
+void vt_emul_invept (void);
+void vt_emul_invvpid (void);
+void vt_emul_vmwrite (void);
+void vt_emul_vmread (void);
+void vt_emul_vmlaunch (void);
+void vt_emul_vmresume (void);
 
 #endif

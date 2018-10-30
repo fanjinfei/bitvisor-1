@@ -48,23 +48,55 @@
 #include "vmmerr.h"
 #include "vmmcall.h"
 
-static void
+static bool
 svm_nmi (void)
 {
 	struct svm *svm;
 
 	svm = &current->u.svm;
-	if (svm->intr.vmcb_intr_info.s.v)
-		return;
-	if (svm->vi.vmcb->v_intr_masking)
-		return;
-	if (!current->nmi.get_nmi_count ())
-		return;
+	if (!current->nmi.get_nmi_count () && !svm->nmi_pending)
+		return false;
+	if (svm->intr.vmcb_intr_info.s.v) {
+		if (svm->intr.vmcb_intr_info.s.type == VMCB_EVENTINJ_TYPE_NMI)
+			return false;
+		svm->nmi_pending = true;
+		svm->vi.vmcb->intercept_pause = 1;
+		svm->vi.vmcb->intercept_hlt = 1;
+		svm->vi.vmcb->intercept_mwait_uncond = 1;
+		svm->vi.vmcb->intercept_mwait = 1;
+		return false;
+	}
+	if (svm->vi.vmcb->interrupt_shadow) {
+		/* Avoid injecting NMI at IRET in NMI handler. */
+		svm->nmi_pending = true;
+		svm->vi.vmcb->intercept_pause = 1;
+		svm->vi.vmcb->intercept_hlt = 1;
+		svm->vi.vmcb->intercept_mwait_uncond = 1;
+		svm->vi.vmcb->intercept_mwait = 1;
+		return false;
+	}
+	if (svm->vi.vmcb->v_intr_masking || svm->vi.vmcb->intercept_iret) {
+		svm->nmi_pending = true;
+		svm->vi.vmcb->intercept_pause = 0;
+		svm->vi.vmcb->intercept_hlt = 0;
+		svm->vi.vmcb->intercept_mwait_uncond = 0;
+		svm->vi.vmcb->intercept_mwait = 0;
+		return false;
+	}
 	svm->intr.vmcb_intr_info.v = 0;
 	svm->intr.vmcb_intr_info.s.vector = EXCEPTION_NMI;
 	svm->intr.vmcb_intr_info.s.type = VMCB_EVENTINJ_TYPE_NMI;
 	svm->intr.vmcb_intr_info.s.ev = 0;
 	svm->intr.vmcb_intr_info.s.v = 1;
+	if (svm->nmi_pending) {
+		svm->nmi_pending = false;
+		svm->vi.vmcb->intercept_pause = 0;
+		svm->vi.vmcb->intercept_hlt = 0;
+		svm->vi.vmcb->intercept_mwait_uncond = 0;
+		svm->vi.vmcb->intercept_mwait = 0;
+	}
+	svm->vi.vmcb->intercept_iret = 1;
+	return true;
 }
 
 static void
@@ -76,15 +108,19 @@ svm_event_injection_setup (void)
 	svm->vi.vmcb->eventinj = svm->intr.vmcb_intr_info.v;
 }
 
-static void
+static bool
 svm_vm_run (void)
 {
+	int nmi_or_init;
+
 	if (current->u.svm.saved_vmcb)
 		spinlock_unlock (&currentcpu->suspend_lock);
-	asm_vmrun_regs (&current->u.svm.vr, current->u.svm.vi.vmcb_phys,
-			currentcpu->svm.vmcbhost_phys);
+	nmi_or_init = asm_vmrun_regs (&current->u.svm.vr,
+				      current->u.svm.vi.vmcb_phys,
+				      currentcpu->svm.vmcbhost_phys);
 	if (current->u.svm.saved_vmcb)
 		spinlock_lock (&currentcpu->suspend_lock);
+	return !!nmi_or_init;
 }
 
 static void
@@ -146,6 +182,87 @@ task_switch_load_segdesc (u16 sel, ulong gdtr_base, ulong gdtr_limit,
 	seg->base = SEGDESC_BASE (desc.s);
 	seg->limit = ((desc.s.limit_15_0 | (desc.s.limit_19_16 << 16))
 		      << (desc.s.g ? 12 : 0)) | (desc.s.g ? 0xFFF : 0);
+}
+
+static ulong
+svm_get_task_switch_len (ulong rip)
+{
+	enum vmmerr err;
+	ulong acr;
+	u64 efer;
+	u8 c, s;
+	bool p66 = false, p67 = false, m32 = false;
+	ulong orig_rip = rip;
+
+	svm_read_msr (MSR_IA32_EFER, &efer);
+	if (efer & MSR_IA32_EFER_LMA_BIT)
+		panic ("Task switch in long mode is not allowed");
+	svm_read_sreg_acr (SREG_CS, &acr);
+	if (acr & ACCESS_RIGHTS_D_B_BIT)
+		m32 = true;
+	for (;;) {
+		err = cpu_seg_read_b (SREG_CS, rip++, &c);
+		if (err) {
+		read_error:
+			panic ("Could not read task switch instruction: %d",
+			       err);
+		}
+		if (c == 0x66) {
+			p66 = true;
+			continue;
+		}
+		if (c == 0x67) {
+			p67 = true;
+			continue;
+		}
+		if (c == 0x26 || c == 0x2E || c == 0x36 || c == 0x3E ||
+		    c == 0x64 || c == 0x65 || c == 0xF2 || c == 0xF3)
+			continue;
+		if (c == 0xCC)	/* INT3 */
+			goto end;
+		if (c == 0xCD) { /* INT */
+			rip++;
+			goto end;
+		}
+		if (c == 0xCE)	/* INTO */
+			goto end;
+		if (c == 0xCF)	/* IRET */
+			goto end;
+		if (c == 0xEA || c == 0x9A) { /* JMP/CALL 1234:5678 */
+			rip += ((m32 && !p66) || (!m32 && p66)) ? 6 : 4;
+			goto end;
+		}
+		if (c == 0xFF)	/* JMP/CALL FAR PTR [1234] */
+			break;
+		panic ("Unsupported opcode %02X in task switch", c);
+	}
+	err = cpu_seg_read_b (SREG_CS, rip++, &c);
+	if (err)
+		goto read_error;
+	if ((c & 0300) == 0300)
+		panic ("Invalid opcode FF %02X:"
+		       " task switch with register operand", c);
+	if ((!m32 && !p67) || (m32 && p67)) {
+		/* 16bit address */
+		rip += (c & 0307) == 06 ? 2 : c >> 6;
+		goto end;
+	}
+	/* 32bit address */
+	if ((c & 07) == 04) {
+		/* SIB byte */
+		if (!(c & 0300)) { /* (c & 0307) == 04 */
+			err = cpu_seg_read_b (SREG_CS, rip++, &s);
+			if (err)
+				goto read_error;
+			if ((s & 07) == 05)
+				c++; /* Now (c & 0307) == 05 */
+		} else {
+			rip++;
+		}
+	}
+	rip += (c & 0300) == 0200 || (c & 0307) == 05 ? 4 : c >> 6;
+end:
+	return rip - orig_rip;
 }
 
 static void
@@ -231,6 +348,12 @@ svm_task_switch (void)
 	svm_read_sreg_sel (SREG_GS, &tmp16); tss32_1.gs = tmp16;
 	tss32_1.eflags = rflags;
 	svm_read_ip (&tmp); tss32_1.eip = tmp;
+	if (!current->u.svm.intr.vmcb_intr_info.s.v ||
+	    (current->u.svm.intr.vmcb_intr_info.s.type ==
+	     VMCB_EVENTINJ_TYPE_EXCEPTION &&
+	     (current->u.svm.intr.vmcb_intr_info.s.vector == 3 ||
+	      current->u.svm.intr.vmcb_intr_info.s.vector == 4)))
+		tss32_1.eip += svm_get_task_switch_len (tmp);
 	r = write_linearaddr_q (gdtr_base + tr_sel, tss1_desc.v);
 	if (r != VMMERR_SUCCESS)
 		goto err;
@@ -429,17 +552,19 @@ do_stgi (void)
 {
 	current->u.svm.vi.vmcb->v_intr_masking = 0;
 	current->u.svm.vi.vmcb->rip += 3;
+	svm_nmi ();
 }
 
 static void
 do_vmrun (void)
 {
+	int nmi_or_init;
 	ulong vmcb_phys;
 	struct vmcb *vmcb;
 	enum vmcb_tlb_control orig_tlb_control;
 	struct svm *svm = &current->u.svm;
 
-	if (current->u.svm.vm_cr & MSR_AMD_VM_CR_SVMDIS_BIT) {
+	if (!current->u.svm.svme) {
 		svm->intr.vmcb_intr_info.v = 0;
 		svm->intr.vmcb_intr_info.s.vector = EXCEPTION_UD;
 		svm->intr.vmcb_intr_info.s.type = VMCB_EVENTINJ_TYPE_EXCEPTION;
@@ -455,12 +580,16 @@ do_vmrun (void)
 		if (vmcb->tlb_control != VMCB_TLB_CONTROL_FLUSH_TLB)
 			vmcb->tlb_control = svm->vi.vmcb->tlb_control;
 	}
-	asm_vmrun_regs_nested (&svm->vr, svm->vi.vmcb_phys,
-			       currentcpu->svm.vmcbhost_phys, vmcb_phys,
-			       svm->vi.vmcb->rflags & RFLAGS_IF_BIT);
+	nmi_or_init = asm_vmrun_regs_nested (&svm->vr, svm->vi.vmcb_phys,
+					     currentcpu->svm.vmcbhost_phys,
+					     vmcb_phys, svm->vi.vmcb->rflags &
+					     RFLAGS_IF_BIT);
 	vmcb->tlb_control = orig_tlb_control;
-	svm->vi.vmcb->rip += 3;
 	unmapmem (vmcb, sizeof *vmcb);
+	if (nmi_or_init)
+		svm_nmi ();
+	else
+		svm->vi.vmcb->rip += 3;
 }
 
 static void
@@ -475,6 +604,65 @@ do_invlpga (void)
 	else if (asid != current->u.svm.vi.vmcb->guest_asid)
 		asm_invlpga (address, asid);
 	current->u.svm.vi.vmcb->rip += 3;
+}
+
+static ulong
+svm_get_pause_hlt_or_mwait_nrip (ulong rip)
+{
+	enum vmmerr err;
+	u8 c;
+
+	do {
+		err = cpu_seg_read_b (SREG_CS, rip++, &c);
+		if (err) {
+		read_error:
+			panic ("Could not read hlt or mwait instruction: %d",
+			       err);
+		}
+	} while (c == 0x26 || c == 0x2E || c == 0x36 || c == 0x3E ||
+		 c == 0x64 || c == 0x65 || c == 0xF2 || c == 0xF3 ||
+		 c == 0x66 || c == 0x67); /* Prefix */
+	if (c == 0x90 || c == 0xF4) /* NOP(PAUSE), HLT */
+		return rip;
+	if (c != 0x0F)
+		panic ("Unsupported opcode %02X for hlt or mwait", c);
+	err = cpu_seg_read_b (SREG_CS, rip++, &c);
+	if (err)
+		goto read_error;
+	if (c != 0x01)
+		panic ("Unsupported opcode 0F %02X for hlt or mwait", c);
+	err = cpu_seg_read_b (SREG_CS, rip++, &c);
+	if (err)
+		goto read_error;
+	if (c != 0xC9 && c != 0xFB) /* MWAIT, MWAITX */
+		panic ("Unsupported opcode 0F 01 %02X for hlt or mwait", c);
+	return rip;
+}
+
+static void
+do_pause_hlt_or_mwait (void)
+{
+	struct vmcb *vmcb;
+
+	/* Just skip the instruction for nmi_pending */
+	vmcb = current->u.svm.vi.vmcb;
+	if (currentcpu->svm.nrip_save && vmcb->nrip)
+		vmcb->rip = vmcb->nrip;
+	else
+		vmcb->rip = svm_get_pause_hlt_or_mwait_nrip (vmcb->rip);
+}
+
+static void
+do_iret (void)
+{
+	struct vmcb *vmcb;
+
+	/* Set interrupt window to block external interrupts at
+	 * IRET. */
+	vmcb = current->u.svm.vi.vmcb;
+	vmcb->intercept_iret = 0;
+	vmcb->interrupt_shadow = 1;
+	svm_nmi ();
 }
 
 static void
@@ -533,6 +721,15 @@ svm_exit_code (void)
 	case VMEXIT_INVLPGA:
 		do_invlpga ();
 		break;
+	case VMEXIT_PAUSE:
+	case VMEXIT_HLT:
+	case VMEXIT_MWAIT:
+	case VMEXIT_MWAIT_CONDITIONAL:
+		do_pause_hlt_or_mwait ();
+		break;
+	case VMEXIT_IRET:
+		do_iret ();
+		break;
 	default:
 		panic ("unsupported exitcode");
 	}
@@ -571,18 +768,24 @@ svm_wait_for_sipi (void)
 static void
 svm_mainloop (void)
 {
+	bool nmi;
+
 	for (;;) {
 		schedule ();
 		panic_test ();
 		if (current->u.svm.init_signal ||
 		    current->initipi.get_init_count ())
 			svm_wait_for_sipi ();
-		svm_nmi ();
 		svm_event_injection_setup ();
-		svm_vm_run ();
+		nmi = svm_vm_run ();
 		svm_tlbflush ();
-		svm_event_injection_check ();
-		svm_exit_code ();
+		if (!nmi) {
+			svm_event_injection_check ();
+			if (!svm_nmi ())
+				svm_exit_code ();
+		} else {
+			svm_nmi ();
+		}
 	}
 }
 

@@ -228,7 +228,7 @@ init_admin_queue (struct nvme_host *host)
 }
 
 static void
-reset_controller (struct nvme_host *host)
+do_reset_controller (struct nvme_host *host)
 {
 	printf ("Controller reset occurs\n");
 
@@ -262,6 +262,24 @@ reset_controller (struct nvme_host *host)
 	}
 
 	host->n_ns = 0;
+}
+
+static void
+reset_controller (struct nvme_host *host)
+{
+	host->io_ready = 0;
+	wait_for_interceptor (host);
+	spinlock_lock (&host->lock);
+	host->enable = 0;
+	while (host->handling_comp) {
+		dprintf (NVME_ETC_DEBUG,
+			 "Wait for completion handler for reset\n");
+		spinlock_unlock (&host->lock);
+		schedule ();
+		spinlock_lock (&host->lock);
+	}
+	do_reset_controller (host);
+	spinlock_unlock (&host->lock);
 }
 
 static void
@@ -319,12 +337,7 @@ nvme_cc_reg_write (void *data,
 end:
 	if (host->enable &&
 	    (!NVME_CC_GET_ENABLE (value) || NVME_CC_GET_SHN (value))) {
-		host->io_ready = 0;
-		wait_for_interceptor (host);
-		spinlock_lock (&host->lock);
-		host->enable = 0;
 		reset_controller (host);
-		spinlock_unlock (&host->lock);
 		dprintf (NVME_ETC_DEBUG, "NVMe has been disabled\n");
 	} else if (!host->enable && NVME_CC_GET_ENABLE (value)) {
 		spinlock_lock (&host->lock);
@@ -704,7 +717,19 @@ intercept_db_write (struct nvme_host *host, uint idx, void *buf, uint len)
 		u16 g_new_tail = write_value & NVME_DB_REG_MASK;
 
 		update_new_tail_pos (host, queue_id, g_new_tail);
-		nvme_try_process_requests (host, queue_id);
+		/*
+		 * Postpone processing Admin commands if a completion handler
+		 * is running. This is to prevent unexpected errors when
+		 * the guest wants to delete a queue.
+		 */
+		if (queue_id != 0) {
+			nvme_try_process_requests (host, queue_id);
+		} else {
+			spinlock_lock (&host->lock);
+			if (!host->handling_comp)
+				nvme_try_process_requests (host, queue_id);
+			spinlock_unlock (&host->lock);
+		}
 		nvme_unlock_subm_queue (host, queue_id);
 		try_polling_for_completeness (host, queue_id);
 	} else {
@@ -725,6 +750,45 @@ nvme_reg_rw (bool wr, void *reg, void *buf, uint len)
 		memcpy (buf, reg, len); /* Read access */
 	else
 		memcpy (reg, buf, len); /* Write access */
+}
+
+static int
+nvme_reg_msi_handler (void *data,
+		      phys_t gphys,
+		      bool wr,
+		      void *buf,
+		      uint len,
+		      u32 flags)
+{
+	static u64 dummy_buf; /* Avoid optimization */
+
+	struct nvme_data *nvme_data = (struct nvme_data *)data;
+	struct nvme_host *host	    = nvme_data->host;
+	struct nvme_regs *nvme_regs = host->msix_bar == 0 ?
+				      host->regs :
+				      host->msix_regs;
+
+	phys_t acc_start = gphys;
+
+	u8 *reg = nvme_regs->reg_map + (acc_start - nvme_regs->iobase);
+	nvme_reg_rw (wr, reg, buf, len);
+
+	if (!host->msix_vector_base)
+		return 1;
+
+	phys_t msix_start = nvme_regs->iobase + host->msix_vector_base;
+	phys_t msix_end = msix_start + (host->msix_n_vectors * 16);
+
+	if (acc_start >= msix_start && acc_start < msix_end) {
+		if ((acc_start & 0xf) == 0xc && wr &&
+		    !(*(u8 *)buf & 1)) {
+			/* Read the register again to flush the write */
+			nvme_reg_rw (!wr, reg, &dummy_buf, len);
+			nvme_completion_handler (nvme_data, -1);
+		}
+	}
+
+	return 1;
 }
 
 /*
@@ -858,15 +922,8 @@ nvme_reg_handler (void *data,
 		if (!wr) {
 			memcpy (buf, NVME_NSSRC_REG (nvme_regs), len);
 		} else {
-			if (TO_U32 (buf) == NVME_NSSRC_MAGIC) {
-				host->io_ready = 0;
-				wait_for_interceptor (host);
-				spinlock_lock (&host->lock);
-				host->enable = 0;
+			if (TO_U32 (buf) == NVME_NSSRC_MAGIC)
 				reset_controller (host);
-				spinlock_unlock (&host->lock);
-			}
-
 			memcpy (NVME_NSSRC_REG (nvme_regs), buf, len);
 		}
 
@@ -936,21 +993,15 @@ nvme_reg_handler (void *data,
 
 	} else if (acc_start >= db_start) {
 		/*
-		 * Some controllers decide to put MSI/MSI-X related registers
-		 * to BAR 0 at the offset beyond all controller registers.
-		 * We need to allow accessing registers.
+		 * MSI/MSI-X registers located in BAR 0 at the offset beyond
+		 * all controller registers. We need to allow accessing them.
 		 */
-		u8 *reg = nvme_regs->reg_map + (acc_start - nvme_regs->iobase);
-		nvme_reg_rw (wr, reg, buf, len);
-		if (acc_start >= nvme_regs->iobase + 0x3000 &&
-		    acc_start < nvme_regs->iobase + 0x3100 &&
-		    host->vendor_id == NVME_VENDOR_ID_SAMSUNG &&
-		    host->device_id == NVME_DEV_SAMSUNG_A808) {
-			if ((acc_start & 0xf) == 0xc && wr &&
-			    !(*(u8 *)buf & 1)) {
-				nvme_completion_handler (nvme_data, -1);
-			}
-		}
+		return nvme_reg_msi_handler (data,
+					     gphys,
+					     wr,
+					     buf,
+					     len,
+					     flags);
 	} else {
 		if (!wr)
 			memset (buf, 0, len);
@@ -960,50 +1011,83 @@ end:
 }
 
 static void
-unreghook (struct nvme_data *nvme_data)
+unreghook (struct nvme_data *nvme_data, uint bar_idx)
 {
-	if (nvme_data->enabled) {
-		mmio_unregister (nvme_data->handler);
-		unmapmem (nvme_data->host->regs->reg_map,
-			  nvme_data->host->regs->map_nbytes);
-
-		nvme_data->enabled = 0;
+	struct nvme_host *host = nvme_data->host;
+	if (bar_idx == 0) {
+		if (nvme_data->enabled) {
+			mmio_unregister (nvme_data->handler);
+			unmapmem (host->regs->reg_map,
+				  host->regs->map_nbytes);
+			nvme_data->enabled = 0;
+		}
+	} else {
+		ASSERT (bar_idx == host->msix_bar);
+		mmio_unregister (nvme_data->msix_handler);
+		unmapmem (host->msix_regs->reg_map,
+			  host->msix_regs->map_nbytes);
 	}
 }
 
 static void
-reghook (struct nvme_data *nvme_data, struct pci_bar_info *bar)
+do_reghook (struct nvme_data *nvme_data,
+	    struct pci_bar_info *bar,
+	    struct nvme_regs *regs,
+	    void **handler,
+	    int (*reg_handler) (void *data,
+				phys_t gphys,
+				bool wr,
+				void *buf,
+				uint len,
+				u32 flags))
 {
-	if (bar->type == PCI_BAR_INFO_TYPE_NONE ||
-	    bar->type == PCI_BAR_INFO_TYPE_IO)
-		panic ("NVMe BAR_TYPE is not MMIO");
-
-	unreghook (nvme_data);
-
-	nvme_data->enabled = 0;
-
-	struct nvme_regs *regs = nvme_data->host->regs;
-
 	regs->iobase	 = bar->base;
 	regs->reg_map	 = mapmem_gphys (bar->base, bar->len, MAPMEM_WRITE);
 	regs->map_nbytes = bar->len;
 
 	if (!regs->reg_map)
-		panic ("Cannot mapmem_gphys() NVMe registers.");
+		panic ("Cannot mapmem_gphys() NVMe registers");
 
-	nvme_data->handler = mmio_register (bar->base,
-					    bar->len,
-					    nvme_reg_handler,
-					    nvme_data);
+	*handler = mmio_register (bar->base,
+				  bar->len,
+				  reg_handler,
+				  nvme_data);
 
-	if (!nvme_data->handler)
-		panic ("Cannot mmio_register() NVMe registers.");
+	if (!*handler)
+		panic ("Cannot mmio_register() NVMe registers");
+}
+
+static void
+reghook (struct nvme_data *nvme_data,
+	 uint bar_idx,
+	 struct pci_bar_info *bar)
+{
+	if (bar->type == PCI_BAR_INFO_TYPE_NONE ||
+	    bar->type == PCI_BAR_INFO_TYPE_IO)
+		panic ("NVMe BAR_TYPE of BAR %u is not MMIO", bar_idx);
+
+	unreghook (nvme_data, bar_idx);
+
+	if (bar_idx == 0) {
+		nvme_data->enabled = 0;
+		do_reghook (nvme_data,
+			    bar,
+			    nvme_data->host->regs,
+			    &nvme_data->handler,
+			    nvme_reg_handler);
+		nvme_data->enabled = 1;
+	} else {
+		ASSERT (bar_idx == nvme_data->host->msix_bar);
+		do_reghook (nvme_data,
+			    bar,
+			    nvme_data->host->msix_regs,
+			    &nvme_data->msix_handler,
+			    nvme_reg_msi_handler);
+	}
 
 	dprintf (NVME_ETC_DEBUG,
-		 "Register NVMe MMIO base 0x%016llX for %u bytes\n",
-		 bar->base, bar->len);
-
-	nvme_data->enabled = 1;
+		 "Register NVMe MMIO BAR %u base 0x%016llX for %u bytes\n",
+		 bar_idx, bar->base, bar->len);
 }
 
 static void
@@ -1019,6 +1103,25 @@ nvme_enable_dma_and_memory (struct pci_device *pci_device)
 
 	if (command != command_orig)
 		pci_config_write (pci_device, &command, sizeof (u32), 4);
+}
+
+static u8
+find_msix (struct pci_device *pci_device)
+{
+	u32 val;
+	u8 cap;
+
+	/* Read Capabilities Pointer */
+	pci_config_read (pci_device, &cap, sizeof cap, 0x34);
+
+	while (cap >= 0x40) {
+		pci_config_read (pci_device, &val, sizeof val, cap & ~3);
+		if ((val & 0xFF) == 0x11)
+			break;
+		cap = val >> 8; /* Next Capability */
+	}
+
+	return cap < 0x40 ? 0 : cap;
 }
 
 static int
@@ -1062,12 +1165,39 @@ nvme_new (struct pci_device *pci_device)
 
 	struct nvme_regs *nvme_regs = zalloc (NVME_REGS_NBYTES);
 	host->regs = nvme_regs;
+	host->msix_regs = zalloc (NVME_REGS_NBYTES);
 
 	struct nvme_data *nvme_data = zalloc (NVME_DATA_NBYTES);
 	nvme_data->enabled = 0;
 	nvme_data->host = host;
 
-	reghook (nvme_data, &bar_info);
+	u8 msix_offset = find_msix (pci_device);
+
+	if (msix_offset) {
+		u32 val, vector_base;
+		pci_config_read (pci_device, &val, sizeof (val), msix_offset);
+		host->msix_n_vectors = ((val >> 16) & 0x3FF) + 1;
+		vector_base = msix_offset + 0x4;
+		pci_config_read (pci_device, &val, sizeof (val), vector_base);
+		host->msix_vector_base = val & ~0x7;
+		host->msix_bar = val & 0x7;
+		dprintf (NVME_ETC_DEBUG, "MSI-X Capability found\n");
+		dprintf (NVME_ETC_DEBUG, "MSI-X BAR: %u\n", host->msix_bar);
+		dprintf (NVME_ETC_DEBUG,
+			 "MSI-X vector base: 0x%llX\n",
+			 host->msix_vector_base);
+		dprintf (NVME_ETC_DEBUG,
+			 "MSI-X total vectors: %u\n",
+			 host->msix_n_vectors);
+	}
+
+	reghook (nvme_data, 0, &bar_info);
+
+	if (host->msix_bar > 0) {
+		struct pci_bar_info bar_info;
+		pci_get_bar_info (pci_device, host->msix_bar, &bar_info);
+		reghook (nvme_data, host->msix_bar, &bar_info);
+	}
 
 	pci_device->host = nvme_data;
 
@@ -1200,11 +1330,18 @@ nvme_config_write (struct pci_device *pci_device,
 	struct nvme_data *nvme_data = (struct nvme_data *)pci_device->host;
 	struct nvme_host *host	    = nvme_data->host;
 
-	if (i == 0 && host->regs->iobase != bar_info.base) {
+	int change_in_bar0 = i == 0 &&
+			     host->regs->iobase != bar_info.base;
+	int change_in_bar_msix = i == host->msix_bar &&
+				 host->msix_regs->iobase != bar_info.base;
+
+	if (change_in_bar0 || change_in_bar_msix) {
 		dprintf (NVME_ETC_DEBUG,
-			 "NVMe iobase change to 0x%16llX\n", bar_info.base);
-		reghook (nvme_data, &bar_info);
-	} else if (i > 0) {
+			 "NVMe BAR %u iobase change to 0x%16llX\n",
+			 i,
+			 bar_info.base);
+		reghook (nvme_data, i, &bar_info);
+	} else if (i > 0 && i != host->msix_bar) {
 		printf ("NVMe BAR %u is still not supported\n", i);
 	}
 

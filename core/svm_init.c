@@ -29,7 +29,6 @@
 
 #include "asm.h"
 #include "assert.h"
-#include "config.h"
 #include "constants.h"
 #include "cpu.h"
 #include "current.h"
@@ -99,9 +98,9 @@ svm_seg_reset (struct vmcb *p)
 	p->fs.attr = 0x93;
 	p->gs.attr = 0x93;
 	p->gdtr.attr = 0;
-	p->ldtr.attr = 0;
+	p->ldtr.attr = 0x82;
 	p->idtr.attr = 0;
-	p->tr.attr = 0;
+	p->tr.attr = 0x8B;
 	p->es.limit = 0xFFFF;
 	p->cs.limit = 0xFFFF;
 	p->ss.limit = 0xFFFF;
@@ -143,13 +142,17 @@ svm_reset (void)
 	current->u.svm.svme = false;
 	current->u.svm.vm_cr = MSR_AMD_VM_CR_DIS_A20M_BIT |
 		MSR_AMD_VM_CR_LOCK_BIT;
-	if (!config.vmm.unsafe_nested_virtualization)
-		current->u.svm.vm_cr |= MSR_AMD_VM_CR_SVMDIS_BIT;
 	current->u.svm.hsave_pa = 0;
 	current->u.svm.lme = 0;
+	current->u.svm.nmi_pending = false;
 	svm_msr_update_lma ();
 	svm_paging_updatecr3 ();
 	svm_paging_flush_guest_tlb ();
+	current->u.svm.vi.vmcb->intercept_iret = 0;
+	current->u.svm.vi.vmcb->interrupt_shadow = 0;
+	current->u.svm.vi.vmcb->dr7 = 0x400;
+	current->u.svm.vi.vmcb->dr6 = 0xFFFF0FF0;
+	current->u.svm.vi.vmcb->dbgctl = 0;
 }
 
 static void
@@ -238,12 +241,12 @@ svm_init (void)
 	u64 p;
 	u64 tmp;
 	void *v;
-	ulong efer;
+	u64 efer;
 	u32 a, b, c, d;
 
-	asm_rdmsr (MSR_IA32_EFER, &efer);
+	asm_rdmsr64 (MSR_IA32_EFER, &efer);
 	efer |= MSR_IA32_EFER_SVME_BIT;
-	asm_wrmsr (MSR_IA32_EFER, efer);
+	asm_wrmsr64 (MSR_IA32_EFER, efer);
 	asm_rdmsr64 (MSR_AMD_VM_CR, &tmp);
 	tmp |= MSR_AMD_VM_CR_DIS_A20M_BIT | MSR_AMD_VM_CR_R_INIT_BIT;
 	asm_wrmsr64 (MSR_AMD_VM_CR, tmp);
@@ -285,12 +288,12 @@ void
 svm_resume (void)
 {
 	u64 tmp;
-	ulong efer;
+	u64 efer;
 
 	ASSERT (current->u.svm.saved_vmcb);
-	asm_rdmsr (MSR_IA32_EFER, &efer);
+	asm_rdmsr64 (MSR_IA32_EFER, &efer);
 	efer |= MSR_IA32_EFER_SVME_BIT;
-	asm_wrmsr (MSR_IA32_EFER, efer);
+	asm_wrmsr64 (MSR_IA32_EFER, efer);
 	asm_rdmsr64 (MSR_AMD_VM_CR, &tmp);
 	tmp |= MSR_AMD_VM_CR_DIS_A20M_BIT | MSR_AMD_VM_CR_R_INIT_BIT;
 	asm_wrmsr64 (MSR_AMD_VM_CR, tmp);

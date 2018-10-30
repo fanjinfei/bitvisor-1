@@ -40,7 +40,6 @@
 
 #include "nvme.h"
 #include "nvme_io.h"
-#include "nvme_comp_handler.h"
 
 static struct nvme_request *
 get_request (struct nvme_host *host,
@@ -71,12 +70,14 @@ handle_set_feature_cmd (struct nvme_host *host,
 			struct nvme_comp *h_admin_comp,
 			struct nvme_cmd *cmd)
 {
-	u8 feature_id = SET_FEATURE_GET_FEATURE_ID (cmd);
+	u8 feature_id = NVME_SET_FEATURE_GET_FEATURE_ID (cmd);
 
 	u16 max_n_subm_queues, max_n_comp_queues;
 
+	u32 cmd_specific = h_admin_comp->cmd_specific;
+
 	switch (feature_id) {
-	case FEATURE_N_OF_QUEUES:
+	case NVME_SET_FEATURE_N_OF_QUEUES:
 
 		if (host->h_queue.max_n_subm_queues > 0) {
 			printf ("Strange: Duplicated N_OF_QUEUES feature\n");
@@ -85,9 +86,9 @@ handle_set_feature_cmd (struct nvme_host *host,
 
 		/* Values are 0 based, need to plus 1 */
 		max_n_subm_queues =
-			SET_FEATURE_N_SUBM_QUEUES (h_admin_comp) + 1;
+			NVME_SET_FEATURE_N_SUBM_QUEUES (cmd_specific) + 1;
 		max_n_comp_queues =
-			SET_FEATURE_N_COMP_QUEUES (h_admin_comp) + 1;
+			NVME_SET_FEATURE_N_COMP_QUEUES (cmd_specific) + 1;
 
 		nvme_set_max_n_queues (host,
 				       max_n_subm_queues,
@@ -401,6 +402,14 @@ nvme_unlock_comp_queue (struct nvme_host *host, u16 comp_queue_id)
 void
 nvme_process_all_comp_queues (struct nvme_host *host)
 {
+	spinlock_lock (&host->lock);
+	if (!host->enable) {
+		spinlock_unlock (&host->lock);
+		return;
+	}
+	host->handling_comp++;
+	spinlock_unlock (&host->lock);
+
 	struct nvme_queue_info *h_comp_queue_info, *g_comp_queue_info;
 
 	/* i = 0 means starting from admin completion queue */
@@ -420,11 +429,6 @@ nvme_process_all_comp_queues (struct nvme_host *host)
 				    g_comp_queue_info);
 		nvme_unlock_comp_queue (host, i);
 	}
-
-	/* Always try to process admin submission queue */
-	nvme_lock_subm_queue (host, 0);
-	nvme_try_process_requests (host, 0);
-	nvme_unlock_subm_queue (host, 0);
 
 	/*
 	 * Submission queues are fetched in a round-robin manner.
@@ -453,22 +457,28 @@ nvme_process_all_comp_queues (struct nvme_host *host)
 		}
 	}
 	spinlock_unlock (&host->lock);
+
+	/*
+	 * Process Admin Commands only if no other completion handler is
+	 * running. This is to prevent unexpected errors when the guest
+	 * wants to remove a queue.
+	 */
+	nvme_lock_subm_queue (host, 0);
+	spinlock_lock (&host->lock);
+	ASSERT (host->handling_comp > 0);
+	host->handling_comp--;
+	if (!host->handling_comp)
+		nvme_try_process_requests (host, 0);
+	spinlock_unlock (&host->lock);
+	nvme_unlock_subm_queue (host, 0);
 }
 
 int
 nvme_completion_handler (void *data, int num)
 {
 	struct nvme_data *nvme_data = data;
-	struct nvme_host *host = nvme_data->host;
 
-	spinlock_lock (&host->lock);
-	if (!host->enable) {
-		spinlock_unlock (&host->lock);
-		return num;
-	}
-	spinlock_unlock (&host->lock);
-
-	nvme_process_all_comp_queues (host);
+	nvme_process_all_comp_queues (nvme_data->host);
 
 	return num;
 }

@@ -229,6 +229,13 @@ struct nvme_cmd {
 #define NVME_ADMIN_OPCODE_SECURITY_SEND	    (0x81)
 #define NVME_ADMIN_OPCODE_SECURITY_RECV	    (0x82)
 
+#define NVME_SET_FEATURE_GET_FEATURE_ID(cmd) ((cmd)->cmd_flags[0] & 0xFF)
+
+#define NVME_SET_FEATURE_N_OF_QUEUES (0x7)
+
+#define NVME_SET_FEATURE_N_SUBM_QUEUES(cmd_specific) ((cmd_specific) & 0xFFFF)
+#define NVME_SET_FEATURE_N_COMP_QUEUES(cmd_specific) ((cmd_specific) >> 16)
+
 #define NVME_IO_OPCODE_FLUSH		   (0x00)
 #define NVME_IO_OPCODE_WRITE		   (0x01)
 #define NVME_IO_OPCODE_READ		   (0x02)
@@ -401,10 +408,13 @@ struct nvme_host {
 	struct nvme_queue g_queue;
 
 	struct nvme_regs *regs;
+	struct nvme_regs *msix_regs;
 
 	struct nvme_ns_meta *ns_metas;
 
 	struct nvme_io_interceptor *io_interceptor;
+
+	phys_t msix_vector_base;
 
 	u64 max_data_transfer;
 
@@ -417,17 +427,22 @@ struct nvme_host {
 	u32 g_admin_comp_n_entries;
 
 	uint id;
+	uint handling_comp;
 
 	u32 n_ns;
 	u32 page_nbytes;
 	u32 io_subm_entry_nbytes;
 	u32 io_comp_entry_nbytes;
 
+	u16 default_n_subm_queues;
+	u16 default_n_comp_queues;
 	u16 vendor_id;
 	u16 device_id;
 	u16 max_n_entries;
 	u16 queue_to_fetch; /* Used in process_all_comp_queues() */
+	u16 msix_n_vectors;
 
+	u8 msix_bar;
 	u8 db_stride;
 	u8 cmd_set;
 	u8 enable;
@@ -442,13 +457,12 @@ struct nvme_host {
 
 #define NVME_VENDOR_ID_APPLE (0x106B)
 #define NVME_VENDOR_ID_TOSHIBA (0x1179)
-#define NVME_VENDOR_ID_SAMSUNG (0x144D)
 
 #define NVME_DEV_TOSHIBA_0115 (0x0115)
-#define NVME_DEV_SAMSUNG_A808 (0xA808)
 
 struct nvme_data {
 	void *handler;
+	void *msix_handler;
 	struct nvme_host *host;
 
 	u8 enabled;
