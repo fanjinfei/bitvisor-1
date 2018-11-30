@@ -278,8 +278,8 @@ vt__vmcs_init (void)
 	current->u.vt.unrestricted_guest_available = false;
 	current->u.vt.unrestricted_guest = false;
 	current->u.vt.save_load_efer_enable = false;
-	current->u.vt.exint_pass = true;
-	current->u.vt.exint_pending = false;
+	current->u.vt.exint_pass = false;
+	current->u.vt.exint_assert = false;
 	current->u.vt.cr3exit_controllable = vt_cr3exit_controllable ();
 	current->u.vt.cr3exit_off = false;
 	current->u.vt.pcid_available = vt_pcid_available ();
@@ -338,9 +338,11 @@ vt__vmcs_init (void)
 			procbased_ctls2 |=
 				VMCS_PROC_BASED_VMEXEC_CTL2_ENABLE_RDTSCP_BIT;
 		if (procbased_ctls2_and &
-		    VMCS_PROC_BASED_VMEXEC_CTL2_ENABLE_XSAVES_BIT)
+		    VMCS_PROC_BASED_VMEXEC_CTL2_ENABLE_XSAVES_BIT) {
 			procbased_ctls2 |=
 				VMCS_PROC_BASED_VMEXEC_CTL2_ENABLE_XSAVES_BIT;
+			asm_vmwrite64 (VMCS_XSS_EXITING_BMP, 0);
+		}
 		if (procbased_ctls2_and &
 		    VMCS_PROC_BASED_VMEXEC_CTL2_ENABLE_VMCS_SHADOWING_BIT)
 			current->u.vt.vmcs_shadowing_available = true;
@@ -397,7 +399,7 @@ vt__vmcs_init (void)
 		asm_vmwrite64 (VMCS_GUEST_IA32_EFER, 0);
 	/* 32-Bit Control Fields */
 	asm_vmwrite (VMCS_PIN_BASED_VMEXEC_CTL,
-		     (/* VMCS_PIN_BASED_VMEXEC_CTL_EXINTEXIT_BIT */0 |
+		     (VMCS_PIN_BASED_VMEXEC_CTL_EXINTEXIT_BIT |
 		      VMCS_PIN_BASED_VMEXEC_CTL_NMIEXIT_BIT |
 		      VMCS_PIN_BASED_VMEXEC_CTL_VIRTNMIS_BIT |
 		      pinbased_ctls_or) & pinbased_ctls_and);

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013 Igel Co., Ltd.
+ * Copyright (c) 2007, 2008 University of Tsukuba
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -27,24 +27,20 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef _CORE_CALLUEFI_H
-#define _CORE_CALLUEFI_H
+#include "current.h"
+#include "exint.h"
+#include "initfunc.h"
 
-#include "types.h"
+static int
+exint_default_ack (void)
+{
+	return -1;
+}
 
-extern u8 uefi_memory_map_data[16384];
-extern ulong uefi_memory_map_size;
-extern ulong uefi_memory_map_descsize;
+static void
+exint_init (void)
+{
+	current->exint.ack = exint_default_ack;
+}
 
-void call_uefi_get_memory_map (void);
-int call_uefi_allocate_pages (int type, int memtype, u64 npages, u64 *phys);
-int call_uefi_free_pages (u64 phys, u64 npages);
-int call_uefi_create_event_exit_boot_services (u64 phys, u64 context,
-					       void **event_ret);
-u32 call_uefi_getkey (void);
-void call_uefi_putchar (unsigned char c);
-void call_uefi_disconnect_pcidev_driver (ulong seg, ulong bus, ulong dev,
-					 ulong func);
-void copy_uefi_bootcode (void);
-
-#endif
+INITFUNC ("vcpu0", exint_init);
